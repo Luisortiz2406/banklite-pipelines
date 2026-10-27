@@ -1,0 +1,207 @@
+# Pipeline reutilizable de un servicio de BankLite: test → docker → deploy.
+#
+# Cada repositorio banklite-<servicio> lo llama desde su .github/workflows/deploy.yml
+# con `uses: Luisortiz2406/banklite-pipelines/.github/workflows/servicio.yml@v1`
+# y `secrets: inherit`. Ver el README de este repositorio.
+#
+# - test: en pull requests y en main. Lint, formato, build y pruebas (con Postgres
+#   opcional) y una prueba extra opcional por servicio.
+# - docker: solo en main. Construye la imagen y la sube a GHCR con el SHA y `latest`
+#   (queda como registro de cada versión); borra las versiones viejas y deja 5.
+# - deploy: solo en main, después de docker. `railway up --ci` sube el código del
+#   commit y Railway lo construye con el Dockerfile y el railway.json del repo; luego
+#   espera a que el despliegue quede en SUCCESS.
+
+name: Pipeline de servicio
+
+on:
+  workflow_call:
+    inputs:
+      servicio:
+        description: Nombre del servicio en Railway (p. ej. savings-service).
+        type: string
+        required: true
+      postgres:
+        description: Levantar un Postgres de prueba y exportar TEST_DATABASE_URL.
+        type: boolean
+        default: false
+      prueba-extra:
+        description: Comando que se corre al final del job test (p. ej. npm run verificar:esquema).
+        type: string
+        default: ''
+      node-version:
+        description: Versión de Node.js.
+        type: string
+        default: '20'
+    secrets:
+      RAILWAY_TOKEN:
+        description: Token de proyecto de Railway (lively-warmth, entorno production).
+        required: false
+
+env:
+  RAILWAY_ENVIRONMENT: production
+  RAILWAY_CLI_VERSION: 5.71.0
+
+jobs:
+  test:
+    name: Pruebas
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # Con la imagen vacía, GitHub no levanta el contenedor de Postgres.
+    services:
+      postgres:
+        image: ${{ inputs.postgres && 'postgres:16-alpine' || '' }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      # Solo se define si hay Postgres: sin la variable, las pruebas con base se saltan.
+      - name: Base de pruebas (TEST_DATABASE_URL)
+        if: inputs.postgres
+        run: echo "TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres" >> "$GITHUB_ENV"
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Formato (Prettier)
+        run: npm run format:check
+
+      - name: Compilar
+        run: npm run build --if-present
+
+      - name: Pruebas (Jest)
+        run: npm test --if-present
+
+      - name: Prueba extra del servicio
+        if: inputs.prueba-extra != ''
+        env:
+          PRUEBA_EXTRA: ${{ inputs.prueba-extra }}
+          CON_POSTGRES: ${{ inputs.postgres }}
+        run: |
+          if [ "$CON_POSTGRES" = true ]; then
+            command -v psql || (sudo apt-get update -q && sudo apt-get install -y -q postgresql-client)
+          fi
+          bash -c "$PRUEBA_EXTRA"
+
+  docker:
+    name: Imagen Docker (GHCR)
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR exige el nombre en minúsculas (el dueño es Luisortiz2406).
+      - name: Nombre de la imagen
+        id: imagen
+        run: echo "nombre=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Etiquetas
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.imagen.outputs.nombre }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=raw,value=latest
+
+      # Sin provenance ni SBOM, cada push es una sola versión del paquete (sin
+      # manifiestos sueltos), así el borrado de versiones viejas no rompe ninguna imagen.
+      - name: Construir y subir
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Borrar versiones viejas (deja las últimas 5)
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ github.event.repository.name }}
+          package-type: container
+          min-versions-to-keep: 5
+
+  deploy:
+    name: Despliegue (Railway)
+    needs: docker
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # Dos merges seguidos se despliegan en orden; el que está corriendo no se cancela.
+    concurrency:
+      group: railway-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SERVICIO: ${{ inputs.servicio }}
+    steps:
+      - name: Revisar el token de Railway
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::error::Falta el secret RAILWAY_TOKEN en este repositorio."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Instalar la CLI de Railway
+        run: npm install -g "@railway/cli@${RAILWAY_CLI_VERSION}"
+
+      # --ci muestra el log del build y termina cuando el build acaba; no espera el healthcheck.
+      - name: Subir y construir en Railway
+        run: |
+          date -u -d '-5 seconds' +%Y-%m-%dT%H:%M:%S.000Z > /tmp/inicio
+          railway up --ci --service "$SERVICIO" --environment "$RAILWAY_ENVIRONMENT" \
+            --message "GitHub Actions ${GITHUB_SHA} (run ${GITHUB_RUN_ID})"
+
+      - name: Esperar a que el despliegue quede activo
+        run: |
+          inicio=$(cat /tmp/inicio)
+          for _ in $(seq 1 60); do
+            estado=$(railway deployment list --service "$SERVICIO" --environment "$RAILWAY_ENVIRONMENT" --limit 5 --json \
+              | jq -r --arg t "$inicio" '[.[] | select(.createdAt >= $t)] | sort_by(.createdAt) | last | .status // "PENDIENTE"')
+            echo "Estado del despliegue: $estado"
+            case "$estado" in
+              SUCCESS) exit 0 ;;
+              FAILED | CRASHED | REMOVED | SKIPPED)
+                echo "::error::El despliegue de $SERVICIO terminó en $estado. Railway mantiene la versión anterior si el healthcheck no pasó."
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::El despliegue de $SERVICIO no terminó en 10 minutos."
+          exit 1
