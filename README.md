@@ -16,7 +16,7 @@ test ──► docker ──► deploy
 
 | Job | Cuándo corre | Qué hace |
 |---|---|---|
-| `test` (Pruebas) | Pull requests y push a `main` | `npm ci`, ESLint, Prettier (`format:check`), `npm run build` y `npm test` (si existen). Con `postgres: true` levanta un Postgres 16 y exporta `TEST_DATABASE_URL`. Al final corre la `prueba-extra` del servicio, si tiene. |
+| `test` (Pruebas) | Pull requests y push a `main` | `npm ci`, ESLint, Prettier (`format:check`), `npm run build` y `npm test` (si existen; con Jest, con informe de cobertura). Con `postgres: true` levanta un Postgres 16 y exporta `TEST_DATABASE_URL`. Al final corre la `prueba-extra` del servicio, si tiene. |
 | `docker` (Imagen Docker) | Solo push a `main` (o ejecución manual en `main`), si `test` pasó | Construye la imagen con el `Dockerfile` del repo y la sube a GHCR (`ghcr.io/luisortiz2406/banklite-<servicio>`) con dos etiquetas: el SHA del commit y `latest`. Borra las versiones viejas y deja las últimas 5. |
 | `deploy` (Despliegue) | Solo si `docker` pasó | `railway up --ci` sube el código del commit al servicio de Railway (proyecto `lively-warmth`, entorno `production`), Railway lo construye con el `Dockerfile` y el `railway.json` del repo, y el job espera a que el despliegue quede en `SUCCESS` (falla si queda en `FAILED` o `CRASHED`). |
 
@@ -74,6 +74,8 @@ pedir más permisos que esos (`packages: write` es para subir y borrar imágenes
 | `postgres` | sí/no | `false` | Postgres de prueba y `TEST_DATABASE_URL` para las pruebas con base |
 | `prueba-extra` | texto | `''` | Comando que se corre al final de `test` |
 | `node-version` | texto | `20` | Versión de Node.js |
+| `umbral-lineas` | número | `0` | Cobertura mínima de líneas (%) de Jest; con `0` solo se muestra |
+| `umbral-ramas` | número | `0` | Cobertura mínima de ramas (%) de Jest; con `0` solo se muestra |
 
 Configuración de cada repositorio (lo mismo que probaba su `ci.yml`):
 
@@ -83,6 +85,32 @@ Configuración de cada repositorio (lo mismo que probaba su `ci.yml`):
 | auth, card, deposit, fraud, ledger, payment, savings | `true` | — |
 | api-gateway, kyc, notification, transfer | `false` | — |
 | frontend | `false` | `sh scripts/probar-imagen.sh` (construye la imagen de nginx y prueba rutas, archivos que no deben quedar publicados y la CSP) |
+
+### Cobertura de pruebas
+
+Si el servicio tiene Jest configurado en su `package.json`, el paso de pruebas corre
+`npm test -- --coverage` sobre **todo `src/`** (sin `*.spec.ts` ni `main.ts`), de modo
+que un archivo sin pruebas cuenta como 0 % en vez de quedar fuera del cálculo. Después:
+
+- **Resumen de la corrida:** en la pestaña de la corrida de Actions aparece la tabla de
+  líneas, sentencias, funciones y ramas, y los 5 archivos con menos cobertura.
+- **Artefacto `cobertura`:** el informe `lcov` y `coverage-summary.json` (14 días).
+- **Umbral opcional:** con `umbral-lineas` y `umbral-ramas` el job falla si la cobertura
+  queda por debajo. Con el valor por defecto (`0`) solo se muestra el reporte y no se
+  bloquea nada, así que los repositorios que ya usan `@v1` no cambian de comportamiento.
+
+Para exigir un mínimo, el repositorio lo pide en su `deploy.yml`:
+
+```yaml
+    with:
+      servicio: ledger-service
+      postgres: true
+      umbral-lineas: 45
+      umbral-ramas: 23
+```
+
+Los servicios sin Jest (frontend, que usa `node --test`) siguen con `npm test` y el paso
+de cobertura avisa que no hay reporte. Un servicio sin pruebas aparece sin reporte.
 
 ### Secrets
 

@@ -33,6 +33,14 @@ on:
         description: Versión de Node.js.
         type: string
         default: '20'
+      umbral-lineas:
+        description: Cobertura mínima de líneas (%) de Jest. Con 0 solo se muestra el reporte y no se bloquea nada.
+        type: number
+        default: 0
+      umbral-ramas:
+        description: Cobertura mínima de ramas (%) de Jest. Con 0 solo se muestra el reporte y no se bloquea nada.
+        type: number
+        default: 0
     secrets:
       RAILWAY_TOKEN:
         description: Token de proyecto de Railway (lively-warmth, entorno production).
@@ -84,8 +92,74 @@ jobs:
       - name: Compilar
         run: npm run build --if-present
 
+      # Si el servicio configura Jest en package.json, las pruebas corren con cobertura
+      # sobre todo src/ (los globs son relativos al rootDir de Jest, que es src). Los demás
+      # (frontend con node --test, servicios sin pruebas) siguen con `npm test` a secas.
       - name: Pruebas (Jest)
-        run: npm test --if-present
+        run: |
+          if node -e 'process.exit(require("./package.json").jest ? 0 : 1)'; then
+            npm test --if-present -- --coverage \
+              --coverageDirectory="$GITHUB_WORKSPACE/coverage" \
+              --coverageReporters=json-summary --coverageReporters=lcov \
+              --collectCoverageFrom='**/*.ts' \
+              --collectCoverageFrom='!**/*.spec.ts' \
+              --collectCoverageFrom='!main.ts'
+          else
+            npm test --if-present
+          fi
+
+      # Resumen en la corrida y, si se pidió, umbral mínimo. Con umbrales en 0 no bloquea.
+      - name: Cobertura (resumen y umbral)
+        if: ${{ !cancelled() }}
+        env:
+          UMBRAL_LINEAS: ${{ inputs.umbral-lineas }}
+          UMBRAL_RAMAS: ${{ inputs.umbral-ramas }}
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const archivo = 'coverage/coverage-summary.json';
+          if (!fs.existsSync(archivo)) {
+            console.log('::notice::Este servicio no generó cobertura de Jest; no hay reporte.');
+            process.exit(0);
+          }
+          const datos = JSON.parse(fs.readFileSync(archivo, 'utf8'));
+          const total = datos.total;
+          const minimos = { lines: Number(process.env.UMBRAL_LINEAS), branches: Number(process.env.UMBRAL_RAMAS) };
+          const nombres = { lines: 'Líneas', statements: 'Sentencias', functions: 'Funciones', branches: 'Ramas' };
+          const falla = [];
+          const filas = Object.keys(nombres).map((clave) => {
+            const { pct, covered, total: n } = total[clave];
+            const minimo = minimos[clave] || 0;
+            const ok = !minimo || pct >= minimo;
+            if (!ok) falla.push(`${nombres[clave]}: ${pct} % < ${minimo} %`);
+            return `| ${nombres[clave]} | ${pct} % | ${covered}/${n} | ${minimo ? minimo + ' % ' + (ok ? '✅' : '❌') : '—'} |`;
+          });
+          const peores = Object.entries(datos)
+            .filter(([ruta, v]) => ruta !== 'total' && v.lines.total >= 20)
+            .sort((a, b) => a[1].lines.pct - b[1].lines.pct)
+            .slice(0, 5)
+            .map(([ruta, v]) => `| \`${ruta.replace(/^.*[\\/]src[\\/]/, '')}\` | ${v.lines.pct} % | ${v.branches.pct} % |`);
+          const md = [
+            '## Cobertura de pruebas (Jest)', '',
+            '| Métrica | Cobertura | Cubierto | Umbral |', '|---|---|---|---|', ...filas, '',
+            '### Archivos con menos cobertura (20 líneas o más)', '',
+            '| Archivo | Líneas | Ramas |', '|---|---|---|', ...peores, '',
+            'El informe `lcov` completo está en el artefacto **cobertura**.', '',
+          ].join('\n');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md);
+          if (falla.length) {
+            console.log(`::error::Cobertura por debajo del umbral. ${falla.join('; ')}`);
+            process.exit(1);
+          }
+          EOF
+
+      - name: Subir informe de cobertura
+        if: ${{ !cancelled() && hashFiles('coverage/lcov.info') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cobertura
+          path: coverage
+          retention-days: 14
 
       - name: Prueba extra del servicio
         if: inputs.prueba-extra != ''
