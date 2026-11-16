@@ -74,28 +74,51 @@ jobs:
 
       # Secretos en el código o en el historial. No bloquea el despliegue (continue-on-error)
       # hasta revisar lo que encuentre; el resultado queda en el resumen de la corrida.
+      # Reglas por defecto de gitleaks; lo único que se excluye son los archivos de prueba
+      # (*.spec.ts y *.test.ts), donde hay constantes falsas a propósito. Nada más se oculta.
+      - name: Configuración de gitleaks
+        run: |
+          {
+            echo '[extend]'
+            echo 'useDefault = true'
+            echo
+            echo '[allowlist]'
+            echo "description = 'Archivos de prueba con constantes falsas'"
+            echo "paths = ['''(^|/)[^/]+\.spec\.ts$''', '''(^|/)[^/]+\.test\.ts$''']"
+          } > "$RUNNER_TEMP/gitleaks.toml"
+
       - name: Secretos (gitleaks)
         id: gitleaks
         uses: gitleaks/gitleaks-action@v2
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: ${{ runner.temp }}/gitleaks.toml
 
+      # El estado del paso no basta (la acción avisa de fugas sin fallar): se cuentan los
+      # hallazgos del informe results.sarif que deja el escaneo.
       - name: Resultado de gitleaks
         if: ${{ !cancelled() }}
         env:
           RESULTADO: ${{ steps.gitleaks.outcome }}
         run: |
+          hallazgos=''
+          if [ -f results.sarif ]; then
+            hallazgos=$(jq '[.runs[].results // [] | length] | add // 0' results.sarif)
+          fi
           {
             echo '## Secretos (gitleaks)'
             echo
-            if [ "$RESULTADO" = success ]; then
-              echo 'No se encontraron secretos. ✅'
+            if [ -z "$hallazgos" ]; then
+              echo "No se pudo leer el resultado del escaneo (paso: $RESULTADO). ⚠️ Revisa el paso."
+            elif [ "$hallazgos" -eq 0 ]; then
+              echo 'Sin hallazgos. ✅'
             else
-              echo "Gitleaks reportó hallazgos o no pudo correr ($RESULTADO). ⚠️ Revisa el paso. No bloquea el despliegue."
+              echo "$hallazgos hallazgos. ⚠️ Revisa el paso de gitleaks. No bloquea el despliegue."
             fi
             echo
           } >> "$GITHUB_STEP_SUMMARY"
+          rm -f results.sarif
 
       - uses: actions/setup-node@v7
         with:
