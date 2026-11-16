@@ -69,6 +69,33 @@ jobs:
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # gitleaks revisa también el historial
+
+      # Secretos en el código o en el historial. No bloquea el despliegue (continue-on-error)
+      # hasta revisar lo que encuentre; el resultado queda en el resumen de la corrida.
+      - name: Secretos (gitleaks)
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resultado de gitleaks
+        if: ${{ !cancelled() }}
+        env:
+          RESULTADO: ${{ steps.gitleaks.outcome }}
+        run: |
+          {
+            echo '## Secretos (gitleaks)'
+            echo
+            if [ "$RESULTADO" = success ]; then
+              echo 'No se encontraron secretos. ✅'
+            else
+              echo "Gitleaks reportó hallazgos o no pudo correr ($RESULTADO). ⚠️ Revisa el paso. No bloquea el despliegue."
+            fi
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v7
         with:
@@ -82,6 +109,32 @@ jobs:
 
       - name: Instalar dependencias
         run: npm ci
+
+      # Dependencias con vulnerabilidades altas o críticas. No bloquea el despliegue
+      # (continue-on-error): el resultado queda en el resumen de la corrida.
+      - name: Auditoría de dependencias (npm audit)
+        id: audit
+        continue-on-error: true
+        run: |
+          set +e
+          npm audit --audit-level=high 2>&1 | tee audit.txt
+          codigo=${PIPESTATUS[0]}
+          {
+            echo '## Auditoría de dependencias (npm audit)'
+            echo
+            if [ "$codigo" -eq 0 ]; then
+              echo 'Sin vulnerabilidades altas ni críticas. ✅'
+            else
+              echo "Hay vulnerabilidades altas o críticas (código $codigo). ⚠️ No bloquea el despliegue."
+              echo
+              echo '```'
+              tail -n 8 audit.txt
+              echo '```'
+            fi
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f audit.txt
+          exit "$codigo"
 
       - name: Lint (ESLint)
         run: npm run lint

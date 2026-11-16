@@ -1,0 +1,9 @@
+# Dependabot de banklite-pipelines: mantiene al día las acciones que usan los workflows.
+# Este repo no tiene package.json, así que no lleva la entrada de npm (va en los servicios).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
