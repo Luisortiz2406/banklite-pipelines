@@ -86,19 +86,16 @@ jobs:
         env:
           RESULTADO: ${{ steps.gitleaks.outcome }}
         run: |
-          if [ "$RESULTADO" = success ]; then
-            printf '## Secretos (gitleaks)
-
-No se encontraron secretos. ✅
-
-' >> "$GITHUB_STEP_SUMMARY"
-          else
-            printf '## Secretos (gitleaks)
-
-Gitleaks reportó hallazgos o no pudo correr (%s). ⚠️ Revisa el paso. No bloquea el despliegue.
-
-' "$RESULTADO" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo '## Secretos (gitleaks)'
+            echo
+            if [ "$RESULTADO" = success ]; then
+              echo 'No se encontraron secretos. ✅'
+            else
+              echo "Gitleaks reportó hallazgos o no pudo correr ($RESULTADO). ⚠️ Revisa el paso. No bloquea el despliegue."
+            fi
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v7
         with:
